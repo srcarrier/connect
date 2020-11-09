@@ -1,6 +1,8 @@
 package com.linuxforhealth.connect.builder;
 
+import java.time.Instant;
 import java.util.Base64;
+import java.util.Date;
 
 import javax.ws.rs.HttpMethod;
 
@@ -25,12 +27,16 @@ public class KafkaFhirConsumerBuilder extends RouteBuilder {
 	//
 	// Kafka topic envelope for persisting nlp service response
 	//
-	static class KafkaMessageEnvelope {
+	static class NlpMessageEnvelope {
 		
 		String patientId;
 		String data;
 		String id;
 		String resourceType;
+		String resourceTypeElement;
+		String serviceName;
+		Long timestamp;
+		String nlpModelId;
 		
 		public String getPatientId() {
 			return patientId;
@@ -56,6 +62,30 @@ public class KafkaFhirConsumerBuilder extends RouteBuilder {
 		public void setResourceType(String resourceType) {
 			this.resourceType = resourceType;
 		}
+		public String getResourceTypeElement() {
+			return resourceTypeElement;
+		}
+		public void setResourceTypeElement(String resourceTypeElement) {
+			this.resourceTypeElement = resourceTypeElement;
+		}
+		public String getServiceName() {
+			return serviceName;
+		}
+		public void setServiceName(String serviceName) {
+			this.serviceName = serviceName;
+		}
+		public String getNlpModelId() {
+			return nlpModelId;
+		}
+		public void setNlpModelId(String nlpModelId) {
+			this.nlpModelId = nlpModelId;
+		}
+		public Long getTimestamp() {
+			return timestamp;
+		}
+		public void setTimestamp(Long timestamp) {
+			this.timestamp = timestamp;
+		}
 		
 	}
 
@@ -65,7 +95,7 @@ public class KafkaFhirConsumerBuilder extends RouteBuilder {
 		getContext().setStreamCaching(true); // Prevent exchange message body from disappearing after reads
 		
 		//
-		// Consume topic messages from Kafka
+		// Consume topic messages from stream
 		// INPUT:  LinuxForHealth Message Envelope
 		// OUTPUT: FHIR R4 Resource
 		//
@@ -90,11 +120,9 @@ public class KafkaFhirConsumerBuilder extends RouteBuilder {
 							.to("direct:fhir-resource")
 						.endChoice()
 						
-						.otherwise()
-							.to("direct:fhir-resource")
-						.endChoice()
-						
 					.end()
+					
+					.to("direct:fhir-resource")
 					
 				.endChoice()
 				
@@ -118,11 +146,15 @@ public class KafkaFhirConsumerBuilder extends RouteBuilder {
 			.choice()
 			
 				.when(exchangeProperty(PROP_RESOURCE_TYPE).isEqualTo("DocumentReference"))		
-					.multicast().to("direct:text-div", "direct:documentreference-attachment")
+					.multicast()
+					.parallelProcessing()
+					.to("direct:text-div", "direct:documentreference-attachment")
 				.endChoice()
 				
 				.when(exchangeProperty(PROP_RESOURCE_TYPE).isEqualTo("DiagnosticReport"))
-					.multicast().to("direct:text-div", "direct:diagnosticreport-attachment")
+					.multicast()
+					.parallelProcessing()
+					.to("direct:text-div", "direct:diagnosticreport-attachment")
 				.endChoice()
 				
 				.otherwise()
@@ -140,14 +172,17 @@ public class KafkaFhirConsumerBuilder extends RouteBuilder {
 		//
 		from("direct:text-div")
 			.log(LoggingLevel.DEBUG, logger, "[text-div] INPUT:\n${body.substring(0,200)}")
+			.setProperty("resourceTypeElement", constant("narrative"))
 			
 			.choice()
 				.when().jsonpath("text.div", true)
 
+					// << CAMEL-15769 Jira issue opened
 					.split(jsonpath("text.div").tokenize("@@@"))
 		
 					.log(LoggingLevel.DEBUG, logger, "[text-div] before tika:\n${body}")
-					.to("tika:parse?tikaParseOutputFormat=text") // extract text from html tags (e.g. <div>)
+					// extract text from xhtml tags (e.g. <div>)
+					.to("tika:parse?tikaParseOutputFormat=text") 
 					.log(LoggingLevel.DEBUG, logger, "[text-div] after tika:\n${body}")
 					
 					.to("direct:nlp")
@@ -195,6 +230,7 @@ public class KafkaFhirConsumerBuilder extends RouteBuilder {
 		from("direct:attachment")
 		
 			.setProperty("contentType").jsonpath("contentType", true)
+			.setProperty("resourceTypeElement", constant("attachment"))
 			.split().jsonpath("data", true)
 			.unmarshal().base64()
 			
@@ -203,7 +239,10 @@ public class KafkaFhirConsumerBuilder extends RouteBuilder {
 				.when(PredicateBuilder.or(
 					exchangeProperty("contentType").contains("application/pdf"), 
 					exchangeProperty("contentType").contains("text/html")))
-						.to("tika:parse?tikaParseOutputFormat=text") // Convert PDF message to Text
+						.log(LoggingLevel.DEBUG, logger, "[attachment] before tika:\n${body}")
+						// Convert PDF message to Text
+						.to("tika:parse?tikaParseOutputFormat=text")
+						.log(LoggingLevel.DEBUG, logger, "[attachment] after tika:\n${body}")
 						.to("direct:nlp")
 				.endChoice()
 				
@@ -229,6 +268,8 @@ public class KafkaFhirConsumerBuilder extends RouteBuilder {
 					.setHeader(Exchange.CONTENT_TYPE, constant(ContentType.TEXT_PLAIN))
 					.convertBodyTo(String.class)
 					
+					// NLP service http request
+					// Can be modified to call other NLP rest apis
 					.to("https://us-east.wh-acd.cloud.ibm.com/wh-acd/api/v1/analyze/"
 							+ "wh_acd.ibm_clinical_insights_v1.0_standard_flow"
 							+ "?version=2020-10-22"
@@ -240,29 +281,37 @@ public class KafkaFhirConsumerBuilder extends RouteBuilder {
 					
 					.choice()
 					
-						.when(header("CamelHttpResponseCode").isEqualTo("200")) // successful nlp service response
+						.when(header("CamelHttpResponseCode").isEqualTo("200")) // successful response
 							
 							.process(new Processor() {
-								
 								@Override
 								public void process(Exchange exchange) throws Exception {
-									KafkaMessageEnvelope envelope = new KafkaMessageEnvelope();
-									envelope.setData(Base64.getEncoder().encodeToString(exchange.getIn().getBody(String.class).getBytes()));
+									
+									NlpMessageEnvelope envelope = new NlpMessageEnvelope();
+									envelope.setData(Base64.getEncoder().encodeToString(
+											exchange.getIn().getBody(String.class).getBytes()));
 									envelope.setPatientId(exchange.getProperty(PROP_PATIENT_ID, String.class));
-									envelope.setResourceType(exchange.getProperty(PROP_RESOURCE_TYPE, String.class));
+									envelope.setResourceType(exchange.getProperty(
+											PROP_RESOURCE_TYPE, String.class));
 									envelope.setId(exchange.getProperty(PROP_ID, String.class));
+									envelope.setTimestamp(Instant.now().getEpochSecond());
+									envelope.setResourceTypeElement(
+											exchange.getProperty("resourceTypeElement", String.class));
+									
+									// Capture metadata regarding the NLP service employed
+									envelope.setNlpModelId("wh_acd.ibm_clinical_insights_v1.0_standard_flow");
+									envelope.setServiceName("ACD");
+									
 									exchange.getIn().setBody(envelope);
 								}
-								
 							})
 							
 							.marshal().json(JsonLibrary.Jackson)
 							.to("kafka:NLP_OUTPUT?brokers=localhost:9094") // publish kafka topic
 						
 						.endChoice()
-					
+						
 					.end()
-				
 			.end()			
 		;
 		
